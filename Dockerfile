@@ -71,12 +71,20 @@ RUN set -eu; \
     cat /NUMERICS.txt; \
     echo "PASS: CUDA build is clean of fast-math"
 
+# --allow-shlib-undefined is required, not cosmetic: libggml-cuda.so references
+# CUDA *driver* API symbols (cuGetErrorString, the VMM entry points) that live in
+# libcuda.so.1. That library is not in the devel image -- it is injected by
+# nvidia-container-toolkit at `docker run --gpus`, and only a non-functional stub
+# exists at build time. Without this flag the link fails with
+# "undefined reference to `cuGetErrorString'". Upstream's own .devops/cuda.Dockerfile
+# carries the identical flag for the identical reason.
 RUN cmake -S . -B build \
         -DGGML_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
         -DLLAMA_CURL=ON \
         -DLLAMA_BUILD_TESTS=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
  && cmake --build build --config Release -j"$(nproc)" \
         --target llama-perplexity llama-quantize llama-imatrix llama-bench llama-server
 
@@ -93,10 +101,9 @@ RUN set -eu; \
     cp /NUMERICS.txt /opt/llama/NUMERICS.txt
 
 # Record real linkage so the runtime package list is derived, never guessed.
-# libcuda.so.1 is the DRIVER library: it is injected by nvidia-container-toolkit
-# at `docker run --gpus`, and is legitimately absent during build. Resolve it
-# here from the devel image's stub purely so this check can distinguish "driver
-# lib, expected at runtime" from "we forgot to ship a library".
+# The stubs dir is on the path here so that a driver-library reference resolves
+# and this check can distinguish "driver lib, supplied at runtime" from "we
+# forgot to ship a library" -- only the latter should ever fail a build.
 RUN set -eu; \
     LD_LIBRARY_PATH=/opt/llama/lib:/usr/local/cuda/lib64/stubs \
         ldd /opt/llama/bin/llama-perplexity | sort > /opt/llama/DEPS.txt; \
@@ -157,8 +164,11 @@ ENV HF_HUB_ENABLE_HF_TRANSFER=1
 # without a GPU present; libcuda.so.1 is the one lib allowed to be missing here
 # (driver-injected at `docker run --gpus`, see DEPS.txt note in the build stage).
 RUN set -eu; \
-    ldd /opt/llama/bin/llama-perplexity | grep 'not found' | grep -v 'libcuda\.so\.1' \
-        && { echo "FAIL: missing non-driver library"; exit 1; } || true; \
+    MISSING="$(ldd /opt/llama/bin/llama-perplexity 2>/dev/null \
+                 | grep 'not found' | grep -v 'libcuda\.so\.1' || true)"; \
+    if [ -n "$MISSING" ]; then \
+        echo "FAIL: missing non-driver library:"; echo "$MISSING"; exit 1; \
+    fi; \
     test -x /opt/llama/bin/llama-perplexity; \
     test -x /opt/llama/bin/llama-quantize; \
     test -s /opt/llama/REVISION; \

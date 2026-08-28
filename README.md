@@ -66,6 +66,27 @@ must be actively removed on every build.
 **CPU-only torch is deliberate.** `convert_hf_to_gguf.py` is I/O-bound repacking and
 never touches the GPU; the CPU wheel is ~1GB against ~3GB for the CUDA build.
 
+## Linking against a driver that isn't there
+
+The build passes `-DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined`. This is
+required, not cosmetic.
+
+`libggml-cuda.so` references CUDA **driver** API symbols (`cuGetErrorString`, the VMM
+entry points) that live in `libcuda.so.1` — a library that is deliberately absent from
+every CUDA container image. It is injected by `nvidia-container-toolkit` at
+`docker run --gpus`; only a non-functional stub exists at build time. Without the flag
+the build dies at link with:
+
+```
+/usr/bin/ld: libggml-cuda.so: undefined reference to `cuGetErrorString'
+```
+
+Upstream's own `.devops/cuda.Dockerfile` carries the identical flag for the identical
+reason. The consequence is that a *complete* runtime verification is impossible in CI —
+there is no GPU on the runner — so the build-time checks are structural (binaries
+exist, non-driver libraries all resolve) and the first real execution happens on the pod.
+`kld-bootstrap.sh` writing `STATUS.md` is that confirmation.
+
 ## Base image
 
 Both stages use `nvidia/cuda:13.0.3-*-ubuntu24.04` — build on `devel`, runtime on the
