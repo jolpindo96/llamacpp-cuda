@@ -131,15 +131,21 @@ LABEL org.opencontainers.image.revision="${LLAMA_REF}" \
       org.opencontainers.image.title="llamacpp-cuda" \
       org.opencontainers.image.description="Pinned llama.cpp CUDA (sm_80/sm_90) KLD+perplexity image for RunPod A100/H100"
 
-# kld-bootstrap.sh needs: curl (corpus fetch), python3-venv (hf CLI + conversion),
-# openssh-server (RunPod exec), ca-certificates (HTTPS to HF/GHCR), git (escape hatch).
+# libgomp1 is the price of the slim runtime base: ggml links the GNU OpenMP
+# runtime, which arrives implicitly with the toolchain in -devel but is absent
+# from -runtime. The build-stage DEPS gate enumerated every unresolved library
+# and this was the only one, so the list below is derived, not guessed.
+#
+# The rest: curl (corpus fetch), python3-venv (hf CLI + conversion),
+# openssh-server (RunPod exec), ca-certificates (HTTPS to HF/GHCR),
+# git (volume-build escape hatch).
 #
 # apt's openssh-server postinst generates SSH host keys at BUILD time. Baked into
 # a public image that means every pod boots with the same host keypair, whose
 # private half anyone can pull from the registry. They are deleted here; the boot
 # script runs `ssh-keygen -A` to generate fresh per-pod keys.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates python3-venv python3-dev git openssh-server \
+        libgomp1 curl ca-certificates python3-venv python3-dev git openssh-server \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /etc/ssh/ssh_host_*
 

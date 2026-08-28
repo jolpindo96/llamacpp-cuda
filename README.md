@@ -93,9 +93,15 @@ Both stages use `nvidia/cuda:13.0.3-*-ubuntu24.04` — build on `devel`, runtime
 slim `runtime` tag. Same CUDA patch version on both, so cuBLAS is identical under the
 measurement.
 
-Unlike the ROCm sibling (see its "Fat vs slim" note), taking the slim base costs
-nothing here: CUDA publishes a runtime tag at the *same* version, so there is no
+Unlike the ROCm sibling (see its "Fat vs slim" note), the slim base costs no *version
+parity* here: CUDA publishes a runtime tag at the same version, so there is no
 downgrade-to-get-slim tradeoff to refuse.
+
+It does cost exactly one package. `libgomp1` (GNU OpenMP, which ggml links) arrives
+implicitly with the toolchain in `-devel` and is absent from `-runtime`, so it is
+installed explicitly. That was found by the linkage gate rather than by reasoning —
+which is the argument for having the gate: the runtime package list is derived from
+what `ldd` actually reports, never guessed.
 
 **CUDA 13 narrows the host pool.** RunPod Community Cloud hosts range from CUDA 12.4
 to 13.2; a 13.0 image will not start on a 12.x host. Pin the template's
