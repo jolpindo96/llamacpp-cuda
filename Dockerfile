@@ -101,16 +101,26 @@ RUN set -eu; \
     cp /NUMERICS.txt /opt/llama/NUMERICS.txt
 
 # Record real linkage so the runtime package list is derived, never guessed.
-# The stubs dir is on the path here so that a driver-library reference resolves
-# and this check can distinguish "driver lib, supplied at runtime" from "we
-# forgot to ship a library" -- only the latter should ever fail a build.
+#
+# libcuda.so.1 is EXPECTED to be unresolved here and is the only such exemption.
+# It is the driver library, injected by nvidia-container-toolkit at
+# `docker run --gpus`. Note the stubs directory cannot stand in for it: the stub
+# is named libcuda.so while the soname required is libcuda.so.1, and the loader
+# matches on exact filename -- so putting stubs on LD_LIBRARY_PATH resolves
+# nothing. It is left out rather than left in looking useful.
+#
+# Everything else unresolved means we failed to ship a library, which must fail
+# the build.
 RUN set -eu; \
-    LD_LIBRARY_PATH=/opt/llama/lib:/usr/local/cuda/lib64/stubs \
+    LD_LIBRARY_PATH=/opt/llama/lib \
         ldd /opt/llama/bin/llama-perplexity | sort > /opt/llama/DEPS.txt; \
     cat /opt/llama/DEPS.txt; \
-    if grep -q 'not found' /opt/llama/DEPS.txt; then \
-        echo "FAIL: unresolved shared libraries in llama-perplexity"; exit 1; \
-    fi
+    MISSING="$(grep 'not found' /opt/llama/DEPS.txt | grep -v 'libcuda\.so\.1' || true)"; \
+    if [ -n "$MISSING" ]; then \
+        echo "FAIL: unresolved shared libraries in llama-perplexity:"; \
+        echo "$MISSING"; exit 1; \
+    fi; \
+    echo "PASS: only the driver library is unresolved (supplied at runtime)"
 
 # -------------------------------------------------------------- runtime stage
 FROM ${RUNTIME_BASE} AS runtime
