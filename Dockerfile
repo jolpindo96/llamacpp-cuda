@@ -1,0 +1,169 @@
+# syntax=docker/dockerfile:1
+#
+# Pinned llama.cpp CUDA build for A100 (sm_80) / H100 (sm_90), baked into an image.
+#
+# Purpose: quantization-quality measurement -- KL-divergence, perplexity, imatrix
+# -- on rented NVIDIA GPUs. The entire value of this image is that the numbers it
+# produces are trustworthy, which is why the fast-math gate below is a hard build
+# failure rather than a warning.
+#
+# Base: nvidia/cuda:13.0.3-{devel,runtime}-ubuntu24.04
+#   Build and runtime share the SAME CUDA patch version on purpose: identical
+#   cuBLAS under the measurement. Unlike the ROCm sibling repo (llamacpp-hip),
+#   CUDA publishes a slim runtime tag at the same version, so taking the slim
+#   base costs no version parity here -- this is not the "downgrade to get slim"
+#   tradeoff that repo documents under "Fat vs slim".
+#
+# CUDA 13 is deliberate (matches the local RTX 5090 stack). It narrows the
+# RunPod Community Cloud host pool to newer drivers, so pin the template's
+# allowedCudaVersions to 13.x rather than discovering it as a boot failure.
+
+ARG CUDA_VERSION=13.0.3
+ARG BUILD_BASE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
+ARG RUNTIME_BASE=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
+
+# ---------------------------------------------------------------- build stage
+FROM ${BUILD_BASE} AS build
+
+ARG LLAMA_REF
+# A100 = sm_80, H100 = sm_90. Carrying both is nearly free (CI build is cached
+# and runs on GitHub's dime) and means renting whichever card is available on a
+# given day never requires a new image.
+ARG CUDA_ARCHS="80;90"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git ccache libcurl4-openssl-dev libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN test -n "${LLAMA_REF}" || { echo "LLAMA_REF build-arg is required"; exit 1; } \
+ && git clone https://github.com/ggml-org/llama.cpp . \
+ && git checkout -q "${LLAMA_REF}" \
+ && git rev-parse HEAD | tee /REVISION
+
+# --- Numerics gate: CUDA builds must NOT use fast-math. ----------------------
+# Upstream ggml-cuda/CMakeLists.txt ships `set(CUDA_FLAGS -use_fast_math -extended-lambda)`.
+# -use_fast_math implies -ftz=true, -prec-div=false, -prec-sqrt=false and lets nvcc
+# contract/reassociate FP ops. For a KLD/perplexity rig that is disqualifying: this
+# image exists to MEASURE precision loss, so the build must not silently introduce
+# its own.
+#
+# This is the inverse of the HIP sibling repo's gate. There, upstream had already
+# removed the offending flag and the check merely VERIFIES its absence. Here the
+# flag is present on master, so we strip it and then PROVE the strip landed.
+#
+# Why prove it: a bare `sed` silently no-ops if upstream reorders or renames the
+# flag, yielding a fast-math binary that reports plausible-but-wrong divergence.
+# The grep turns that silent failure into a red build.
+RUN set -eu; \
+    echo "--- CUDA_FASTMATH_STRIP ---"; \
+    cp ggml/src/ggml-cuda/CMakeLists.txt /tmp/cuda-cmake.orig; \
+    sed -i 's/[[:space:]]*-use_fast_math//g' ggml/src/ggml-cuda/CMakeLists.txt; \
+    if grep -rEn 'use_fast_math|ffast-math|funsafe-math|fassociative-math' \
+            ggml/src/ggml-cuda/CMakeLists.txt ggml/CMakeLists.txt; then \
+        echo "FAIL: fast-math flag survived the strip"; \
+        exit 1; \
+    fi; \
+    { echo "# fast-math strip applied at build time"; \
+      echo "# pin: ${LLAMA_REF}"; \
+      diff -u /tmp/cuda-cmake.orig ggml/src/ggml-cuda/CMakeLists.txt || true; \
+    } > /NUMERICS.txt; \
+    cat /NUMERICS.txt; \
+    echo "PASS: CUDA build is clean of fast-math"
+
+RUN cmake -S . -B build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+        -DLLAMA_CURL=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build build --config Release -j"$(nproc)" \
+        --target llama-perplexity llama-quantize llama-imatrix llama-bench llama-server
+
+# Collect binaries, the shared libs they were built against, and the pieces the
+# HF->GGUF conversion path needs (convert_hf_to_gguf.py imports from gguf-py).
+RUN set -eu; \
+    mkdir -p /opt/llama/bin /opt/llama/lib; \
+    cp build/bin/llama-perplexity build/bin/llama-quantize build/bin/llama-imatrix \
+       build/bin/llama-bench build/bin/llama-server /opt/llama/bin/; \
+    find build -name '*.so*' -exec cp -P {} /opt/llama/lib/ \; ; \
+    cp convert_hf_to_gguf.py /opt/llama/; \
+    cp -r gguf-py /opt/llama/gguf-py; \
+    cp /REVISION /opt/llama/REVISION; \
+    cp /NUMERICS.txt /opt/llama/NUMERICS.txt
+
+# Record real linkage so the runtime package list is derived, never guessed.
+# libcuda.so.1 is the DRIVER library: it is injected by nvidia-container-toolkit
+# at `docker run --gpus`, and is legitimately absent during build. Resolve it
+# here from the devel image's stub purely so this check can distinguish "driver
+# lib, expected at runtime" from "we forgot to ship a library".
+RUN set -eu; \
+    LD_LIBRARY_PATH=/opt/llama/lib:/usr/local/cuda/lib64/stubs \
+        ldd /opt/llama/bin/llama-perplexity | sort > /opt/llama/DEPS.txt; \
+    cat /opt/llama/DEPS.txt; \
+    if grep -q 'not found' /opt/llama/DEPS.txt; then \
+        echo "FAIL: unresolved shared libraries in llama-perplexity"; exit 1; \
+    fi
+
+# -------------------------------------------------------------- runtime stage
+FROM ${RUNTIME_BASE} AS runtime
+
+ARG LLAMA_REF
+LABEL org.opencontainers.image.revision="${LLAMA_REF}" \
+      org.opencontainers.image.source="https://github.com/ggml-org/llama.cpp" \
+      org.opencontainers.image.title="llamacpp-cuda" \
+      org.opencontainers.image.description="Pinned llama.cpp CUDA (sm_80/sm_90) KLD+perplexity image for RunPod A100/H100"
+
+# kld-bootstrap.sh needs: curl (corpus fetch), python3-venv (hf CLI + conversion),
+# openssh-server (RunPod exec), ca-certificates (HTTPS to HF/GHCR), git (escape hatch).
+#
+# apt's openssh-server postinst generates SSH host keys at BUILD time. Baked into
+# a public image that means every pod boots with the same host keypair, whose
+# private half anyone can pull from the registry. They are deleted here; the boot
+# script runs `ssh-keygen -A` to generate fresh per-pod keys.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates python3-venv python3-dev git openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/ssh/ssh_host_*
+
+COPY --from=build /opt/llama /opt/llama
+
+# CUDA runtime debs do register with the dynamic linker, but /opt/llama/lib
+# (the ggml/llama shared objects) does not exist as far as ld.so is concerned.
+RUN printf '/opt/llama/lib\n' > /etc/ld.so.conf.d/llamacpp.conf \
+ && ldconfig
+
+# Conversion toolchain: CPU-only torch on purpose. convert_hf_to_gguf.py is
+# I/O-bound repacking, never touches the GPU, and the CPU wheel is ~1GB against
+# ~3GB for the CUDA build. Baked so a fresh pod converts BF16 safetensors
+# immediately instead of pip-installing on the meter.
+RUN python3 -m venv /opt/llama/venv \
+ && /opt/llama/venv/bin/pip install -q -U pip \
+ && /opt/llama/venv/bin/pip install -q --index-url https://download.pytorch.org/whl/cpu torch \
+ && /opt/llama/venv/bin/pip install -q -U \
+        "huggingface_hub[hf_transfer,cli]" transformers safetensors \
+        sentencepiece protobuf numpy \
+ && /opt/llama/venv/bin/pip install -q /opt/llama/gguf-py
+
+COPY kld-bootstrap.sh /usr/local/bin/kld-bootstrap.sh
+RUN chmod +x /usr/local/bin/kld-bootstrap.sh
+
+ENV PATH=/opt/llama/bin:/opt/llama/venv/bin:${PATH}
+ENV HF_HOME=/workspace/hf-cache
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+
+# Verify the baked artifacts actually work in the runtime image rather than
+# trusting COPY (exit codes lie). --version does not initialise CUDA, so it runs
+# without a GPU present; libcuda.so.1 is the one lib allowed to be missing here
+# (driver-injected at `docker run --gpus`, see DEPS.txt note in the build stage).
+RUN set -eu; \
+    ldd /opt/llama/bin/llama-perplexity | grep 'not found' | grep -v 'libcuda\.so\.1' \
+        && { echo "FAIL: missing non-driver library"; exit 1; } || true; \
+    test -x /opt/llama/bin/llama-perplexity; \
+    test -x /opt/llama/bin/llama-quantize; \
+    test -s /opt/llama/REVISION; \
+    test -s /opt/llama/NUMERICS.txt; \
+    /opt/llama/venv/bin/python -c 'import torch, transformers, gguf; print("conv deps OK", torch.__version__)'; \
+    echo "PASS: runtime image verified at $(cat /opt/llama/REVISION)"
+
+CMD ["/usr/local/bin/kld-bootstrap.sh"]

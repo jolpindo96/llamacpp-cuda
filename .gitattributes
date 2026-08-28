@@ -1,0 +1,6 @@
+# These are executed inside Linux containers; CRLF breaks the shebang
+# ("bad interpreter: /usr/bin/env bash^M") and Dockerfile RUN lines.
+* text=auto eol=lf
+*.sh        text eol=lf
+*.yml       text eol=lf
+Dockerfile  text eol=lf
