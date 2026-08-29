@@ -97,6 +97,7 @@ RUN set -eu; \
     find build -name '*.so*' -exec cp -P {} /opt/llama/lib/ \; ; \
     cp convert_hf_to_gguf.py /opt/llama/; \
     cp -r gguf-py /opt/llama/gguf-py; \
+    cp -r conversion /opt/llama/conversion; \
     cp /REVISION /opt/llama/REVISION; \
     cp /NUMERICS.txt /opt/llama/NUMERICS.txt
 
@@ -195,6 +196,17 @@ RUN printf 'PATH="/opt/llama/bin:/opt/llama/venv/bin:/usr/local/nvidia/bin:/usr/
 # trusting COPY (exit codes lie). --version does not initialise CUDA, so it runs
 # without a GPU present; libcuda.so.1 is the one lib allowed to be missing here
 # (driver-injected at `docker run --gpus`, see DEPS.txt note in the build stage).
+#
+# The convert_hf_to_gguf.py --help line is not redundant with the import check
+# above it. That script also imports its sibling `conversion` package (upstream
+# split the per-architecture converters out of the monolithic script), and an
+# earlier build shipped the script without that package. Importing
+# torch/transformers/gguf succeeded, so the image looked fine and the
+# ModuleNotFoundError only surfaced when a conversion was first attempted -- on
+# the pod, on the meter. --help exercises the real import chain here instead.
+#
+# Comments stay outside the RUN: a `#` line between backslash continuations
+# depends on the parser stripping it, which is not a thing to rely on in a gate.
 RUN set -eu; \
     MISSING="$(ldd /opt/llama/bin/llama-perplexity 2>/dev/null \
                  | grep 'not found' | grep -v 'libcuda\.so\.1' || true)"; \
@@ -206,6 +218,7 @@ RUN set -eu; \
     test -s /opt/llama/REVISION; \
     test -s /opt/llama/NUMERICS.txt; \
     /opt/llama/venv/bin/python -c 'import torch, transformers, gguf; print("conv deps OK", torch.__version__)'; \
+    cd /opt/llama && /opt/llama/venv/bin/python convert_hf_to_gguf.py --help >/dev/null; \
     echo "PASS: runtime image verified at $(cat /opt/llama/REVISION)"
 
 CMD ["/usr/local/bin/kld-bootstrap.sh"]
