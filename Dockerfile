@@ -175,6 +175,22 @@ ENV PATH=/opt/llama/bin:/opt/llama/venv/bin:${PATH}
 ENV HF_HOME=/workspace/hf-cache
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
+# ENV above only reaches the container's own entrypoint. An `ssh pod "command"`
+# session is spawned by sshd, not by that process, and a non-interactive bash
+# skips /etc/profile and returns early from ~/.bashrc -- so `llama-perplexity`
+# is "command not found" over SSH despite being on the image's PATH. Since SSH
+# is how this pod is actually driven, that made the baked binaries reachable
+# only by absolute path.
+#
+# /etc/environment is read by pam_env for SSH logins including non-interactive
+# ones, so it is the one place that fixes all of them. It performs no variable
+# expansion, hence the literal list. profile.d covers interactive shells too.
+RUN printf 'PATH="/opt/llama/bin:/opt/llama/venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\nHF_HOME="/workspace/hf-cache"\nHF_HUB_ENABLE_HF_TRANSFER="1"\n' \
+        > /etc/environment \
+ && printf '#!/bin/sh\nexport PATH=/opt/llama/bin:/opt/llama/venv/bin:$PATH\nexport HF_HOME=/workspace/hf-cache\nexport HF_HUB_ENABLE_HF_TRANSFER=1\n' \
+        > /etc/profile.d/llama.sh \
+ && chmod +x /etc/profile.d/llama.sh
+
 # Verify the baked artifacts actually work in the runtime image rather than
 # trusting COPY (exit codes lie). --version does not initialise CUDA, so it runs
 # without a GPU present; libcuda.so.1 is the one lib allowed to be missing here

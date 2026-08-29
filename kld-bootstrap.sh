@@ -83,11 +83,26 @@ fi
 # --- 3. Test corpus ----------------------------------------------------------
 # wikitext-2 test split: the constant across every measurement in this campaign,
 # so cross-model numbers stay comparable.
+#
+# Verified by CONTENT, not by curl's exit code. The bare .raw path under this
+# dataset repo does not exist; curl -sL cheerfully wrote the 15-byte
+# "Entry not found" body and exited 0. STATUS.md then reported READY over a
+# corpus that would have produced a perplexity run across zero chunks. Fetch the
+# zip (a path that does exist) and gate on the extracted size.
 mkdir -p "$CORPUS_DIR"
-if [ ! -s "$CORPUS_DIR/wiki.test.raw" ]; then
-    curl -sL --retry 5 --retry-delay 3 -o "$CORPUS_DIR/wiki.test.raw" \
-      https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw/wiki.test.raw \
+CORPUS="$CORPUS_DIR/wiki.test.raw"
+if [ ! -s "$CORPUS" ] || [ "$(wc -c < "$CORPUS")" -lt 1000000 ]; then
+    curl -sL --retry 5 --retry-delay 3 -o "$CORPUS_DIR/w.zip" \
+      https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip \
       || fail "corpus download"
+    # python rather than unzip: the venv is already here, one less apt package.
+    "$VENV/bin/python" -c \
+      "import zipfile; zipfile.ZipFile('$CORPUS_DIR/w.zip').extractall('$CORPUS_DIR')" \
+      || fail "corpus extract"
+    cp "$CORPUS_DIR/wikitext-2-raw/wiki.test.raw" "$CORPUS" || fail "corpus place"
+    rm -f "$CORPUS_DIR/w.zip"
+    GOT="$(wc -c < "$CORPUS")"
+    [ "$GOT" -gt 1000000 ] || fail "corpus is $GOT bytes, expected ~1.29MB"
 fi
 
 mkdir -p "$WS/models" "$WS/kld" "$WS/hf-cache"
