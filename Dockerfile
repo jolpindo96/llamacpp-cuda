@@ -31,6 +31,23 @@ ARG LLAMA_REF
 # given day never requires a new image.
 ARG CUDA_ARCHS="80;90"
 
+# Flash-attention KV-cache type combinations to compile. Upstream replaced
+# GGML_CUDA_FA_ALL_QUANTS with this in #28079; an uncompiled combination now
+# falls back at runtime with a warning rather than being unavailable, which is
+# easy to miss in a log and silently changes what you are measuring.
+#
+# The upstream default is "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16". Passing this
+# REPLACES that default, so every entry we still need must be repeated here --
+# in particular f16-f16, which is the default KV cache type and therefore what
+# every standard perplexity/KLD run uses. Dropping it would break the baseline.
+#
+# Beyond the defaults we add the combinations James actually serves with, so the
+# rig can measure a model at its real serving config rather than only at f16:
+#   q5_1-q4_1  Qwen3.8-27B CUDA server config (-ctk q5_1 -ctv q4_1)
+#   bf16-q8_0  Gemma-4-31B no-image config
+#   q5_1-q5_1  Qwen3.8 Vulkan config
+ARG CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;q5_1-q4_1;bf16-q8_0;q5_1-q5_1"
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git ccache libcurl4-openssl-dev libssl-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -84,6 +101,7 @@ RUN cmake -S . -B build \
         -DLLAMA_CURL=ON \
         -DLLAMA_BUILD_TESTS=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA_FA_QUANTS="${CUDA_FA_QUANTS}" \
         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
  && cmake --build build --config Release -j"$(nproc)" \
         --target llama-perplexity llama-quantize llama-imatrix llama-bench llama-server
@@ -161,12 +179,18 @@ RUN printf '/opt/llama/lib\n' > /etc/ld.so.conf.d/llamacpp.conf \
 # I/O-bound repacking, never touches the GPU, and the CPU wheel is ~1GB against
 # ~3GB for the CUDA build. Baked so a fresh pod converts BF16 safetensors
 # immediately instead of pip-installing on the meter.
+#
+# numpy is pinned to match upstream's requirements/*.txt (numpy~=2.2.6), NOT
+# left to `-U`. Upstream bumped to 2.4.6 (#28649) and reverted it within a day
+# (#28654); an unpinned install here would pull exactly the version they backed
+# out of, into the toolchain that produces the BF16 KLD reference. Bump this
+# only when upstream's requirements files bump.
 RUN python3 -m venv /opt/llama/venv \
  && /opt/llama/venv/bin/pip install -q -U pip \
  && /opt/llama/venv/bin/pip install -q --index-url https://download.pytorch.org/whl/cpu torch \
  && /opt/llama/venv/bin/pip install -q -U \
         "huggingface_hub[hf_transfer,cli]" transformers safetensors \
-        sentencepiece protobuf numpy \
+        sentencepiece protobuf "numpy~=2.2.6" \
  && /opt/llama/venv/bin/pip install -q /opt/llama/gguf-py
 
 COPY kld-bootstrap.sh /usr/local/bin/kld-bootstrap.sh

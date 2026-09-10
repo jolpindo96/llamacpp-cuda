@@ -87,6 +87,31 @@ there is no GPU on the runner — so the build-time checks are structural (binar
 exist, non-driver libraries all resolve) and the first real execution happens on the pod.
 `kld-bootstrap.sh` writing `STATUS.md` is that confirmation.
 
+## Flash-attention KV-cache combinations
+
+`GGML_CUDA_FA_QUANTS` (upstream #28079 replaced `GGML_CUDA_FA_ALL_QUANTS`) controls
+which KV-cache type pairs get FA kernels compiled. An uncompiled pair now falls back
+at runtime **with only a warning** — easy to miss in a log, and it silently changes
+what you are measuring.
+
+Passing the flag *replaces* the upstream default
+(`q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16`), so this image repeats those and adds the
+combinations actually served with:
+
+| Pair | Why |
+|---|---|
+| `f16-f16` | default KV type — **every** standard PPL/KLD run; never drop it |
+| `bf16-bf16` | BF16 reference runs |
+| `q8_0-q8_0` | Gemma-4-31B, Muse Glimmer server configs |
+| `q5_1-q4_1` | Qwen3.8-27B CUDA server config |
+| `bf16-q8_0` | Gemma-4-31B no-image config |
+| `q5_1-q5_1` | Qwen3.8 Vulkan config |
+| `q4_0-q4_0` | upstream default, kept |
+
+This is what makes it possible to measure a model **at its real serving config**, not
+only at f16 — e.g. running perplexity twice, once with quantized KV cache and once at
+BF16, to price the cache quantization itself.
+
 ## Base image
 
 Both stages use `nvidia/cuda:13.0.3-*-ubuntu24.04` — build on `devel`, runtime on the
