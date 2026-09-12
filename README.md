@@ -1,8 +1,17 @@
 # llamacpp-cuda
 
-Pinned llama.cpp CUDA builds for **A100 (sm_80)** and **H100 (sm_90)**, baked into a
-bootable image and published to GHCR. Built for one job: **measuring quantization
-quality** — KL-divergence, perplexity, imatrix — on rented NVIDIA GPUs.
+Pinned llama.cpp CUDA builds for **A100 (sm_80)**, **H100 (sm_90)**, **B200 (sm_100)**
+and **B300 / Blackwell Ultra (sm_103)**, baked into a bootable image and published to
+GHCR. Built for one job: **measuring quantization quality** — KL-divergence, perplexity,
+imatrix — on rented NVIDIA GPUs.
+
+> **Datacenter Blackwell runs Hopper-tier kernels.** ggml-cuda defines its Blackwell
+> tier as CC 1200 (consumer / RTX PRO) and integrates only that family's tensor-core
+> instructions. CC 10.0 / 10.3 land in the Hopper tier: `blackwell_mma_available()` is
+> false and the Blackwell branches in `fattn.cu` / `mmvq.cu` are skipped. B200/B300
+> work but are **not tuned** — no tcgen05, no native FP4. A llama.cpp B300-vs-MI355X
+> comparison therefore measures engine coverage, not silicon; gfx950 *does* have
+> CDNA4-specific paths. Use SGLang/vLLM for a hardware comparison.
 
 CUDA sibling of [`llamacpp-hip`](https://github.com/jolpindo96/llamacpp-hip) (MI300X / gfx942).
 

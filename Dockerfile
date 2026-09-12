@@ -26,10 +26,20 @@ ARG RUNTIME_BASE=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
 FROM ${BUILD_BASE} AS build
 
 ARG LLAMA_REF
-# A100 = sm_80, H100 = sm_90. Carrying both is nearly free (CI build is cached
-# and runs on GitHub's dime) and means renting whichever card is available on a
-# given day never requires a new image.
-ARG CUDA_ARCHS="80;90"
+# A100 = sm_80, H100 = sm_90, B200 = sm_100, B300 (Blackwell Ultra) = sm_103.
+# CI build runs on GitHub's dime, so carrying all four means renting whichever
+# card is available on a given day never requires a new image.
+#
+# CAVEAT on the datacenter-Blackwell entries, which is a property of llama.cpp
+# and not of this image: ggml-cuda defines GGML_CUDA_CC_BLACKWELL as 1200 (the
+# consumer / RTX PRO family) and states in common.cuh that it integrates only
+# that family's tensor-core instructions. CC 10.0 and 10.3 therefore fall in
+# the Hopper tier (>= 900, < 1200): blackwell_mma_available() is false, and the
+# Blackwell branches in fattn.cu / mmvq.cu are not taken. B200/B300 run
+# Hopper-era kernels -- no tcgen05, no native FP4. They work; they are not
+# tuned. A llama.cpp B300-vs-MI355X number measures engine coverage, not
+# silicon, because gfx950 does have CDNA4-specific paths (incl. MXFP4).
+ARG CUDA_ARCHS="80;90;100;103"
 
 # Flash-attention KV-cache type combinations to compile. Upstream replaced
 # GGML_CUDA_FA_ALL_QUANTS with this in #28079; an uncompiled combination now
