@@ -46,7 +46,7 @@ jobs:
           echo "image=ghcr.io/$OWNER/llamacpp-cuda" >> "$GITHUB_OUTPUT"
           echo "Pinning llama.cpp @ $REF -> ghcr.io/$OWNER/llamacpp-cuda:$REF"
 
-      # nvidia/cuda devel is ~6GB and the CUDA build tree (four SM targets, so four
+      # nvidia/cuda devel is ~6GB and the CUDA build tree (five SM targets, so five
       # sets of fatbin objects) adds several more; a stock runner does not have room.
       - name: Free disk space
         uses: ggml-org/free-disk-space@v1.3.1
@@ -98,6 +98,6 @@ jobs:
             echo '```'
             echo ""
             echo "llama.cpp pin: \`${{ steps.vars.outputs.ref }}\`"
-            echo "Arch targets: sm_80 (A100), sm_90 (H100), sm_100 (B200), sm_103 (B300) -- datacenter Blackwell runs Hopper-tier kernels, see README"
+            echo "Arch targets: sm_80 (A100), sm_90 (H100), sm_100 (B200), sm_103 (B300), sm_120a (RTX PRO 6000) -- only sm_120 is Blackwell-optimized in llama.cpp, see README"
             echo "Numerics: \`-use_fast_math\` stripped and verified at build time"
           } >> "$GITHUB_STEP_SUMMARY"

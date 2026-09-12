@@ -26,9 +26,16 @@ ARG RUNTIME_BASE=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
 FROM ${BUILD_BASE} AS build
 
 ARG LLAMA_REF
-# A100 = sm_80, H100 = sm_90, B200 = sm_100, B300 (Blackwell Ultra) = sm_103.
-# CI build runs on GitHub's dime, so carrying all four means renting whichever
-# card is available on a given day never requires a new image.
+# A100 = sm_80, H100 = sm_90, B200 = sm_100, B300 (Blackwell Ultra) = sm_103,
+# RTX PRO 6000 Blackwell = sm_120. CI build runs on GitHub's dime, so carrying
+# all five means renting whichever card is available on a given day never
+# requires a new image.
+#
+# sm_120 is spelled "120a-real" on purpose, matching upstream's own CMake. The
+# "a" suffix is what enables the family-specific tensor-core instructions;
+# plain "120" compiles but leaves blackwell_mma_available() and the native-FP4
+# path unused, which would defeat the point of adding it. "-real" only: upstream
+# notes there is no benefit to shipping PTX for Blackwell until Rubin.
 #
 # CAVEAT on the datacenter-Blackwell entries, which is a property of llama.cpp
 # and not of this image: ggml-cuda defines GGML_CUDA_CC_BLACKWELL as 1200 (the
@@ -39,7 +46,11 @@ ARG LLAMA_REF
 # Hopper-era kernels -- no tcgen05, no native FP4. They work; they are not
 # tuned. A llama.cpp B300-vs-MI355X number measures engine coverage, not
 # silicon, because gfx950 does have CDNA4-specific paths (incl. MXFP4).
-ARG CUDA_ARCHS="80;90;100;103"
+# No "a" suffix on 100/103 because llama.cpp has no sm_100a code to unlock.
+#
+# Net: of the three Blackwells here, sm_120 is the ONLY one llama.cpp actually
+# optimizes for.
+ARG CUDA_ARCHS="80;90;100;103;120a-real"
 
 # Flash-attention KV-cache type combinations to compile. Upstream replaced
 # GGML_CUDA_FA_ALL_QUANTS with this in #28079; an uncompiled combination now
