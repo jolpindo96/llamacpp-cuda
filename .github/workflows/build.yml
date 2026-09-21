@@ -98,6 +98,7 @@ jobs:
             echo '```'
             echo ""
             echo "llama.cpp pin: \`${{ steps.vars.outputs.ref }}\`"
+            echo "CUDA base: \`$(sed -n 's/^ARG CUDA_VERSION=//p' Dockerfile)\` (devel + runtime, same patch level)"
             echo "Arch targets: sm_80 (A100), sm_90 (H100), sm_100 (B200), sm_103 (B300), sm_120a (RTX PRO 6000) -- only sm_120 is Blackwell-optimized in llama.cpp, see README"
             echo "Numerics: \`-use_fast_math\` stripped and verified at build time"
           } >> "$GITHUB_STEP_SUMMARY"

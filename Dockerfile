@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1
 #
-# Pinned llama.cpp CUDA build for A100 (sm_80) / H100 (sm_90), baked into an image.
+# Pinned llama.cpp CUDA build for A100 / H100 / B200 / B300 / RTX PRO 6000, baked into an image.
 #
 # Purpose: quantization-quality measurement -- KL-divergence, perplexity, imatrix
 # -- on rented NVIDIA GPUs. The entire value of this image is that the numbers it
 # produces are trustworthy, which is why the fast-math gate below is a hard build
 # failure rather than a warning.
 #
-# Base: nvidia/cuda:13.0.3-{devel,runtime}-ubuntu24.04
+# Base: nvidia/cuda:13.4.1-{devel,runtime}-ubuntu24.04
 #   Build and runtime share the SAME CUDA patch version on purpose: identical
 #   cuBLAS under the measurement. Unlike the ROCm sibling repo (llamacpp-hip),
 #   CUDA publishes a slim runtime tag at the same version, so taking the slim
@@ -17,8 +17,22 @@
 # CUDA 13 is deliberate (matches the local RTX 5090 stack). It narrows the
 # RunPod Community Cloud host pool to newer drivers, so pin the template's
 # allowedCudaVersions to 13.x rather than discovering it as a boot failure.
+#
+# 13.4 rather than 13.0 (tags up to llama-3057bb66c were built on 13.0.3):
+# ggml-cuda's TOP_K uses cub::DeviceTopK only when the bundled CCCL is >= 3.2
+# (top-k.cu), and CUDA 13.0 ships CCCL 3.0. Below that it falls back to a full
+# segmented argsort of every row longer than 1024 columns -- the kernel that
+# sparse-attention indexers (Qwen3.8-Flash-Next's QSA, DeepSeek DSA) hit in
+# every full-attention layer for every token, and the one that was also being
+# called with aliased CUB key buffers until upstream b23701f77. Dense models
+# and MoE routing (n_expert <= 512 -> bitonic path) never reach it, which is
+# why the 13.0 tags remain valid for everything measured on them. Upstream's
+# own release builds moved to 13.4.1 in #29202. The 13.4.1 base image's
+# NVIDIA_REQUIRE_CUDA accepts driver branches 580/590/595/610 (= CUDA 13.0 to
+# 13.3 hosts) through minor-version compatibility, so it starts on the same
+# RunPod hosts the 13.0 image did; the >= 13.0 host check is unchanged.
 
-ARG CUDA_VERSION=13.0.3
+ARG CUDA_VERSION=13.4.1
 ARG BUILD_BASE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
 ARG RUNTIME_BASE=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
 
@@ -169,7 +183,7 @@ ARG LLAMA_REF
 LABEL org.opencontainers.image.revision="${LLAMA_REF}" \
       org.opencontainers.image.source="https://github.com/ggml-org/llama.cpp" \
       org.opencontainers.image.title="llamacpp-cuda" \
-      org.opencontainers.image.description="Pinned llama.cpp CUDA (sm_80/sm_90) KLD+perplexity image for RunPod A100/H100"
+      org.opencontainers.image.description="Pinned llama.cpp CUDA (sm_80/90/100/103/120a) KLD+perplexity image for RunPod A100/H100/B200/B300/RTX PRO 6000"
 
 # libgomp1 is the price of the slim runtime base: ggml links the GNU OpenMP
 # runtime, which arrives implicitly with the toolchain in -devel but is absent

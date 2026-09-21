@@ -128,9 +128,24 @@ BF16, to price the cache quantization itself.
 
 ## Base image
 
-Both stages use `nvidia/cuda:13.0.3-*-ubuntu24.04` — build on `devel`, runtime on the
+Both stages use `nvidia/cuda:13.4.1-*-ubuntu24.04` — build on `devel`, runtime on the
 slim `runtime` tag. Same CUDA patch version on both, so cuBLAS is identical under the
-measurement.
+measurement. Tags up to `3057bb66c` were built on `13.0.3`; see [Pins](#pins).
+
+**Why 13.4 and not 13.0.** ggml-cuda's `TOP_K` uses `cub::DeviceTopK` only when the
+toolkit's bundled CCCL is ≥ 3.2 (`top-k.cu`); CUDA 13.0 ships CCCL 3.0, 13.2 → 3.2,
+13.4 → 3.4. Below 3.2 every row longer than 1024 columns falls back to a full
+segmented argsort — the kernel that sparse-attention indexers (Qwen3.8-Flash-Next's
+QSA, DeepSeek's DSA) hit in every full-attention layer for every token, and the one
+that was also called with aliased CUB key buffers until upstream `b23701f77`
+(#28389). Dense models and MoE routing (`n_expert` ≤ 512 takes the bitonic path)
+never reach it, which is why the 13.0 tags stay valid for everything measured on
+them. Upstream's own release builds moved to 13.4.1 in #29202.
+
+**Host compatibility is unchanged.** The 13.4.1 base's `NVIDIA_REQUIRE_CUDA` accepts
+driver branches 580 / 590 / 595 / 610 — CUDA 13.0 through 13.3 hosts — through
+minor-version compatibility, so the image starts wherever the 13.0 one did. The
+≥ 13.0 host check below still applies.
 
 Unlike the ROCm sibling (see its "Fat vs slim" note), the slim base costs no *version
 parity* here: CUDA publishes a runtime tag at the same version, so there is no
@@ -147,6 +162,32 @@ to 13.2; a 13.0 image will not start on a 12.x host. Pin the template's
 `allowedCudaVersions` to 13.x so the scheduler only places you on compatible hosts,
 rather than discovering it as a boot failure. (Three pods were lost to exactly this
 class of mismatch before the pattern was understood.)
+
+## Pins
+
+Tags are per llama.cpp commit and never `:latest`. **Never mix tags within one
+comparison set** — a bump changes kernels, tile configs and the CUDA base, and the
+numbers stop being comparable even when every model still loads.
+
+| Tag | llama.cpp | CUDA base | Use it for |
+|---|---|---|---|
+| `26394b4e6` | b11067+7, 2026-09-21 | 13.4.1 | **Qwen3.8-Flash-Next** (`qwen4exp`): needs `41abbfd59` rms_norm+mul fusion, `37b53fd45` hc ops, `3cf03257f` sparse FA and the `b23701f77` argsort fix, all post-`3057bb66c`. Also carries `ce8caa6e6` (Gemma 4 FA tile retune) — same precision, different summation order, so Gemma 4 numbers from this tag are not comparable with the 13.0 tags. |
+| `3057bb66c` | b10931, 2026-09-12 | 13.0.3 | The existing measurement set (Qwen3.5/3.6/3.8, Gemma 4, Nemotron 3 Nano, Muse Glimmer); B200 campaign. Both CUDA correctness fixes (`b74f590ea`, `73a43d1f6`). |
+| `91f6a6cf3` | b10883, 2026-09-09 | 13.0.3 | Superseded by `3057bb66c`: identical CUDA path (the two commits between them are HIP-only), sm_80/sm_90 only. |
+| `0cae43063` | b10839, 2026-09-07 | 13.0.3 | Superseded — sm_80/sm_90 only, upstream-default FA pairs only. |
+| `c589f0ed1`, `fe2120bc9` | b10688 / b10740 | 13.0.3 | Superseded; no reason to use either. |
+| `a30273376` | b10545, 2026-08-20 | 13.0.3 | Reproduces the 2026-08-29 Qwen3.8 / fusion / Muse Glimmer numbers; FA divergent-barrier UB (`b74f590ea`) was live in-path. |
+
+The standing test before cutting a new tag, run against the tag you would replace:
+
+```bash
+git log --oneline <pin>..origin/master -- ggml/src/ggml-cuda tools/perplexity
+```
+
+Empty means the pin is fine. Only three things justify a bump: a model the pin cannot
+load, a correctness fix that is actually on the measurement path (read the kernel's
+dispatch gate, not the commit title), or a new quant type. If you bump mid-campaign,
+re-measure the whole set.
 
 ## Building a pin
 
