@@ -77,6 +77,7 @@ must be actively removed on every build.
 | `/opt/llama/NUMERICS.txt` | the fast-math strip diff |
 | `/opt/llama/DEPS.txt` | `ldd` of the binary and of every backend module — derived, not guessed |
 | `/opt/llama/CPU_VARIANTS.txt` | the CPU backend variants built into the image (`-r2` tags on) |
+| `/opt/llama/PYDEPS.txt` | `pip freeze` of the conversion venv — the versions this build actually got (`-r2` tags on) |
 
 **CPU-only torch is deliberate.** `convert_hf_to_gguf.py` is I/O-bound repacking and
 never touches the GPU; the CPU wheel is ~1GB against ~3GB for the CUDA build.

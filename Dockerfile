@@ -239,13 +239,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /etc/ssh/ssh_host_*
 
-COPY --from=build /opt/llama /opt/llama
-
-# CUDA runtime debs do register with the dynamic linker, but /opt/llama/lib
-# (the ggml/llama shared objects) does not exist as far as ld.so is concerned.
-RUN printf '/opt/llama/lib\n' > /etc/ld.so.conf.d/llamacpp.conf \
- && ldconfig
-
 # Conversion toolchain: CPU-only torch on purpose. convert_hf_to_gguf.py is
 # I/O-bound repacking, never touches the GPU, and the CPU wheel is ~1GB against
 # ~3GB for the CUDA build. Baked so a fresh pod converts BF16 safetensors
@@ -256,13 +249,41 @@ RUN printf '/opt/llama/lib\n' > /etc/ld.so.conf.d/llamacpp.conf \
 # (#28654); an unpinned install here would pull exactly the version they backed
 # out of, into the toolchain that produces the BF16 KLD reference. Bump this
 # only when upstream's requirements files bump.
+#
+# huggingface_hub is capped below 2 and transformers has a floor because pip
+# backtracks instead of failing. huggingface_hub 2.0.0 shipped 2026-09-24; pip
+# took it, found that transformers 5.x requires <2.0, and walked transformers
+# back to 4.10 (2021, no upper bound on the hub), whose tokenizers<0.11 has no
+# Python 3.12 wheel and needs Rust -- the llama-26394b4e6-r2 build died there
+# after an hour of compiling. Had that old tokenizers shipped a wheel, the image
+# would have built with a 2021 transformers and nothing would have looked
+# wrong. <2 is transformers' own requirement; the floor is upstream's pinned
+# version (requirements-convert_legacy_llama.txt), so a conflict now fails
+# loudly instead of time-travelling.
+#
+# This layer sits BEFORE `COPY --from=build` on purpose: it depends only on the
+# runtime base, so BuildKit runs it in parallel with the CUDA compile and a PyPI
+# problem fails the build in minutes instead of an hour in. gguf-py, which does
+# come from the build stage, is installed after the copy.
 RUN python3 -m venv /opt/llama/venv \
  && /opt/llama/venv/bin/pip install -q -U pip \
  && /opt/llama/venv/bin/pip install -q --index-url https://download.pytorch.org/whl/cpu torch \
  && /opt/llama/venv/bin/pip install -q -U \
-        "huggingface_hub[hf_transfer,cli]" transformers safetensors \
-        sentencepiece protobuf "numpy~=2.2.6" \
- && /opt/llama/venv/bin/pip install -q /opt/llama/gguf-py
+        "huggingface_hub[hf_transfer,cli]<2" "transformers>=4.57.6" safetensors \
+        sentencepiece protobuf "numpy~=2.2.6"
+
+COPY --from=build /opt/llama /opt/llama
+
+# CUDA runtime debs do register with the dynamic linker, but /opt/llama/lib
+# (the ggml/llama shared objects) does not exist as far as ld.so is concerned.
+RUN printf '/opt/llama/lib\n' > /etc/ld.so.conf.d/llamacpp.conf \
+ && ldconfig
+
+# The pinned commit's own gguf-py, not PyPI's. PYDEPS.txt records every Python
+# package version the toolchain ended up with: the unpinned ones resolve on
+# build day, so the image has to say what it got.
+RUN /opt/llama/venv/bin/pip install -q /opt/llama/gguf-py \
+ && /opt/llama/venv/bin/pip freeze > /opt/llama/PYDEPS.txt
 
 COPY kld-bootstrap.sh /usr/local/bin/kld-bootstrap.sh
 RUN chmod +x /usr/local/bin/kld-bootstrap.sh
@@ -320,6 +341,8 @@ RUN set -eu; \
     echo "$LOADLOG" | grep -q 'loaded CPU backend from /opt/llama/lib/libggml-cpu-' \
         || { echo "FAIL: the backend loader did not load a CPU variant from /opt/llama/lib"; echo "$LOADLOG"; exit 1; }; \
     test -s /opt/llama/CPU_VARIANTS.txt; \
+    test -s /opt/llama/PYDEPS.txt; \
+    grep -iE '^(torch|transformers|huggingface.hub|tokenizers|numpy|gguf)[=@ ]' /opt/llama/PYDEPS.txt || true; \
     test -x /opt/llama/bin/llama-perplexity; \
     test -x /opt/llama/bin/llama-quantize; \
     test -s /opt/llama/REVISION; \
