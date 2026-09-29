@@ -143,8 +143,8 @@ RUN set -eu; \
 #   GGML_BACKEND_DL=ON     backends become dlopen'd modules (the next flag needs it)
 #   GGML_CPU_ALL_VARIANTS  one libggml-cpu-<level>.so per x86 feature level, x64
 #                          baseline through haswell, skylakex, zen4, sapphirerapids;
-#                          at startup ggml scores each against CPUID, loads the best
-#                          and logs "load_backend: loaded CPU backend from <path>"
+#                          at startup ggml scores each against CPUID and loads the
+#                          best (verify-backends.py reports which one)
 #   GGML_BACKEND_DIR       compiled-in search dir for the modules; without it ggml
 #                          only looks next to the executable and in the cwd
 # ggml's CMake makes the ggml target depend on every backend module, so the
@@ -286,7 +286,8 @@ RUN /opt/llama/venv/bin/pip install -q /opt/llama/gguf-py \
  && /opt/llama/venv/bin/pip freeze > /opt/llama/PYDEPS.txt
 
 COPY kld-bootstrap.sh /usr/local/bin/kld-bootstrap.sh
-RUN chmod +x /usr/local/bin/kld-bootstrap.sh
+COPY verify-backends.py /opt/llama/verify-backends.py
+RUN chmod +x /usr/local/bin/kld-bootstrap.sh /opt/llama/verify-backends.py
 
 ENV PATH=/opt/llama/bin:/opt/llama/venv/bin:${PATH}
 ENV HF_HOME=/workspace/hf-cache
@@ -321,12 +322,14 @@ RUN printf 'PATH="/opt/llama/bin:/opt/llama/venv/bin:/usr/local/nvidia/bin:/usr/
 # ModuleNotFoundError only surfaced when a conversion was first attempted -- on
 # the pod, on the meter. --help exercises the real import chain here instead.
 #
-# The loader check runs `--list-devices`, which loads every backend module and
-# exits. The build runner has no GPU and no libcuda.so.1, so the CUDA module
-# cannot load here (a Release build skips that silently); what this proves is
-# that the compiled-in GGML_BACKEND_DIR search finds the CPU variants in
-# /opt/llama/lib and that one of them loads. The CUDA module's own load is
-# checked on the pod by kld-bootstrap.sh, where the driver exists.
+# The loader check asks ggml's registry directly (verify-backends.py: ctypes on
+# libggml.so, ggml_backend_load_all, registered backends + the CPU variant read
+# from /proc/self/maps). It does NOT grep the tools' "load_backend: loaded ..."
+# lines: llama.cpp's logger is asynchronous and `--list-devices` exits before it
+# drains, so those lines are dropped even when the load succeeds -- the first
+# version of this gate failed a working image for exactly that reason. The build
+# runner has no GPU and no libcuda.so.1, so only CPU is required here; the CUDA
+# module's load is checked on the pod by kld-bootstrap.sh, where the driver is.
 #
 # Comments stay outside the RUN: a `#` line between backslash continuations
 # depends on the parser stripping it, which is not a thing to rely on in a gate.
@@ -336,10 +339,7 @@ RUN set -eu; \
     if [ -n "$MISSING" ]; then \
         echo "FAIL: missing non-driver library:"; echo "$MISSING"; exit 1; \
     fi; \
-    LOADLOG="$(/opt/llama/bin/llama-perplexity --list-devices 2>&1 || true)"; \
-    echo "$LOADLOG" | grep 'load_backend' || true; \
-    echo "$LOADLOG" | grep -q 'loaded CPU backend from /opt/llama/lib/libggml-cpu-' \
-        || { echo "FAIL: the backend loader did not load a CPU variant from /opt/llama/lib"; echo "$LOADLOG"; exit 1; }; \
+    python3 /opt/llama/verify-backends.py --require CPU; \
     test -s /opt/llama/CPU_VARIANTS.txt; \
     test -s /opt/llama/PYDEPS.txt; \
     grep -iE '^(torch|transformers|huggingface.hub|tokenizers|numpy|gguf)[=@ ]' /opt/llama/PYDEPS.txt || true; \

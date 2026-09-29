@@ -99,11 +99,10 @@ From `26394b4e6-r2` on, the build uses upstream's own flags
 `skylakex`, `cannonlake`, `cascadelake`, `icelake`, `cooperlake`, `zen4`,
 `alderlake`, `sapphirerapids` — each a separate `libggml-cpu-<level>.so`. At
 startup ggml asks each one to score itself against the host's CPUID and loads the
-best, logging it:
-
-```
-load_backend: loaded CPU backend from /opt/llama/lib/libggml-cpu-zen4.so
-```
+best; `/opt/llama/verify-backends.py` reports which one (see below for why the
+tools' own log line can't be trusted for that). On the GitHub runner, an AMD EPYC
+9V74 whose VM hides AVX-512, it picks `haswell` — exactly the case where a
+`-march=native` build would have baked in the build machine's view of the CPU.
 
 `GGML_BACKEND_DIR=/opt/llama/lib` is compiled in so the loader finds the modules
 there (by default it only looks next to the executable and in the current
@@ -113,9 +112,23 @@ directory).
 skips a module that fails to load *without a message* — a pod whose driver cannot
 serve `libggml-cuda.so` would quietly measure on the CPU instead of refusing to
 start, which a statically linked binary did. `kld-bootstrap.sh` therefore runs
-`llama-perplexity --list-devices`, fails `STATUS.md` unless the CUDA backend loaded,
-and records both `load_backend` lines. The build itself proves the CPU variants are
-found (the CI runner has no GPU, so the CUDA module can only be checked on a pod).
+`/opt/llama/verify-backends.py --require CUDA --require CPU` and fails `STATUS.md`
+unless both registered; the script's output (backends, loaded modules, devices) goes
+into `STATUS.md`. The build runs the same script with `--require CPU` (the CI runner
+has no GPU, so the CUDA module can only be checked on a pod):
+
+```
+backends: CPU
+modules:  libggml-cpu-haswell.so
+device:   CPU = AMD EPYC 9V74 80-Core Processor
+```
+
+The script asks ggml's registry directly (ctypes on `libggml.so`, then
+`ggml_backend_load_all()`) and reads the loaded CPU variant from `/proc/self/maps`.
+It deliberately does **not** grep the tools' `load_backend: loaded ...` lines:
+llama.cpp's logger is asynchronous and `--list-devices` exits before it drains, so
+those lines are dropped even when the load succeeded. The first version of the gate
+relied on them and failed a working image.
 
 ## Linking against a driver that isn't there
 

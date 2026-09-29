@@ -88,16 +88,15 @@ fi
 # modules, and a Release build skips a module that fails to load WITHOUT a
 # message: a pod whose driver cannot serve libggml-cuda.so would quietly measure
 # on the CPU instead of failing. So the CUDA module's load is proven here, and
-# the CPU variant this host selected is recorded. A volume build links its
-# backends normally and prints no load_backend lines, so only baked is gated.
+# the CPU variant this host selected is recorded. verify-backends.py asks ggml's
+# registry directly; the tools' own "load_backend" log lines are unusable for
+# this (asynchronous logger, dropped when --list-devices exits). A volume build
+# links its backends in, so only the baked image is gated.
 BACKENDS=""
-if [ -n "$BIN" ]; then
-    BACKENDS="$("$BIN/llama-perplexity" --list-devices 2>&1 \
-                | grep -E 'load_backend: loaded|^ +[A-Za-z]+[0-9]+: ' || true)"
-    echo "${BACKENDS:-no load_backend lines (backends linked in)}"
-    if [ "$SOURCE" = "baked image" ] && ! printf '%s\n' "$BACKENDS" | grep -q 'loaded CUDA backend'; then
-        fail "CUDA backend module did not load - run: $BIN/llama-perplexity --list-devices"
-    fi
+if [ -n "$BIN" ] && [ "$SOURCE" = "baked image" ] && [ -f /opt/llama/verify-backends.py ]; then
+    BACKENDS="$(python3 /opt/llama/verify-backends.py --require CUDA --require CPU 2>&1)" \
+        || fail "backends did not load: $(printf '%s' "$BACKENDS" | tr '\n' ' ')"
+    echo "$BACKENDS"
 fi
 
 # --- 3. Test corpus ----------------------------------------------------------
@@ -133,8 +132,8 @@ cat > "$WS/STATUS.md" <<EOF
 # Pod bootstrap: READY ($(date -u +%Y-%m-%dT%H:%M:%SZ))
 - llama.cpp: ${ACTIVE_REV:0:9} (source: $SOURCE), binaries in $BIN
 - numerics: fast-math STRIPPED at build (see /opt/llama/NUMERICS.txt)
-- backends (CPU variant = this host's pick of /opt/llama/CPU_VARIANTS.txt):
-$(printf '%s\n' "${BACKENDS:-  (linked in, no load_backend lines)}" | sed 's/^/    /')
+- backends (verify-backends.py; the CPU module is this host's pick of /opt/llama/CPU_VARIANTS.txt):
+$(printf '%s\n' "${BACKENDS:-(not checked: $SOURCE links its backends in)}" | sed 's/^/    /')
 - python: $VENV ($($VENV/bin/python --version 2>&1); torch $($VENV/bin/python -c 'import torch;print(torch.__version__)' 2>/dev/null || echo '?'), CPU-only by design)
 - convert: $VENV/bin/python /opt/llama/convert_hf_to_gguf.py --outtype bf16 <src> --outfile <dst>
 - corpus: $CORPUS_DIR/wiki.test.raw ($(wc -c < "$CORPUS_DIR/wiki.test.raw" 2>/dev/null || echo 0) bytes)
