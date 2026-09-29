@@ -130,9 +130,32 @@ RUN set -eu; \
 # exists at build time. Without this flag the link fails with
 # "undefined reference to `cuGetErrorString'". Upstream's own .devops/cuda.Dockerfile
 # carries the identical flag for the identical reason.
+#
+# CPU backend: portable, never -march=native. GGML_NATIVE defaults ON, which
+# compiles ggml-cpu for whatever CPU the GitHub runner happens to have -- the
+# llama-26394b4e6 build log shows "Adding CPU backend variant ggml-cpu:
+# -march=native". An image built on an AVX-512 runner then dies with SIGILL on a
+# host without it, and two tags' CPU code differs only because they landed on
+# different runners. The CPU backend is on the path even in a fully offloaded
+# run: the token-embedding lookup stays on the host. Same flags as upstream's own
+# .devops/cuda.Dockerfile:
+#   GGML_NATIVE=OFF        no host-specific codegen
+#   GGML_BACKEND_DL=ON     backends become dlopen'd modules (the next flag needs it)
+#   GGML_CPU_ALL_VARIANTS  one libggml-cpu-<level>.so per x86 feature level, x64
+#                          baseline through haswell, skylakex, zen4, sapphirerapids;
+#                          at startup ggml scores each against CPUID, loads the best
+#                          and logs "load_backend: loaded CPU backend from <path>"
+#   GGML_BACKEND_DIR       compiled-in search dir for the modules; without it ggml
+#                          only looks next to the executable and in the cwd
+# ggml's CMake makes the ggml target depend on every backend module, so the
+# --target list below still builds all of them.
 RUN cmake -S . -B build \
         -DGGML_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+        -DGGML_NATIVE=OFF \
+        -DGGML_BACKEND_DL=ON \
+        -DGGML_CPU_ALL_VARIANTS=ON \
+        -DGGML_BACKEND_DIR=/opt/llama/lib \
         -DLLAMA_CURL=ON \
         -DLLAMA_BUILD_TESTS=OFF \
         -DCMAKE_BUILD_TYPE=Release \
@@ -165,13 +188,26 @@ RUN set -eu; \
 #
 # Everything else unresolved means we failed to ship a library, which must fail
 # the build.
+#
+# The backends are dlopen'd modules (see the configure step), so they no longer
+# show up in the executable's ldd output: each module is checked on its own, or
+# libggml-cuda.so's cuBLAS dependencies would go unverified. The CUDA module and
+# the x64 baseline CPU variant must exist -- x64 is what guarantees a loadable CPU
+# backend on any x86-64 host. The variant list is kept in CPU_VARIANTS.txt.
 RUN set -eu; \
-    LD_LIBRARY_PATH=/opt/llama/lib \
-        ldd /opt/llama/bin/llama-perplexity | sort > /opt/llama/DEPS.txt; \
+    test -f /opt/llama/lib/libggml-cuda.so || { echo "FAIL: libggml-cuda.so module missing"; exit 1; }; \
+    test -f /opt/llama/lib/libggml-cpu-x64.so || { echo "FAIL: baseline libggml-cpu-x64.so missing"; exit 1; }; \
+    ls -1 /opt/llama/lib/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so$||' > /opt/llama/CPU_VARIANTS.txt; \
+    echo "CPU variants ($(wc -l < /opt/llama/CPU_VARIANTS.txt)): $(tr '\n' ' ' < /opt/llama/CPU_VARIANTS.txt)"; \
+    : > /opt/llama/DEPS.txt; \
+    for f in /opt/llama/bin/llama-perplexity /opt/llama/lib/libggml-cuda.so /opt/llama/lib/libggml-cpu-*.so; do \
+        echo "== $f" >> /opt/llama/DEPS.txt; \
+        LD_LIBRARY_PATH=/opt/llama/lib ldd "$f" | sort >> /opt/llama/DEPS.txt; \
+    done; \
     cat /opt/llama/DEPS.txt; \
     MISSING="$(grep 'not found' /opt/llama/DEPS.txt | grep -v 'libcuda\.so\.1' || true)"; \
     if [ -n "$MISSING" ]; then \
-        echo "FAIL: unresolved shared libraries in llama-perplexity:"; \
+        echo "FAIL: unresolved shared libraries:"; \
         echo "$MISSING"; exit 1; \
     fi; \
     echo "PASS: only the driver library is unresolved (supplied at runtime)"
@@ -264,14 +300,26 @@ RUN printf 'PATH="/opt/llama/bin:/opt/llama/venv/bin:/usr/local/nvidia/bin:/usr/
 # ModuleNotFoundError only surfaced when a conversion was first attempted -- on
 # the pod, on the meter. --help exercises the real import chain here instead.
 #
+# The loader check runs `--list-devices`, which loads every backend module and
+# exits. The build runner has no GPU and no libcuda.so.1, so the CUDA module
+# cannot load here (a Release build skips that silently); what this proves is
+# that the compiled-in GGML_BACKEND_DIR search finds the CPU variants in
+# /opt/llama/lib and that one of them loads. The CUDA module's own load is
+# checked on the pod by kld-bootstrap.sh, where the driver exists.
+#
 # Comments stay outside the RUN: a `#` line between backslash continuations
 # depends on the parser stripping it, which is not a thing to rely on in a gate.
 RUN set -eu; \
-    MISSING="$(ldd /opt/llama/bin/llama-perplexity 2>/dev/null \
+    MISSING="$(for f in /opt/llama/bin/llama-perplexity /opt/llama/lib/libggml-cuda.so /opt/llama/lib/libggml-cpu-*.so; do ldd "$f" 2>/dev/null; done \
                  | grep 'not found' | grep -v 'libcuda\.so\.1' || true)"; \
     if [ -n "$MISSING" ]; then \
         echo "FAIL: missing non-driver library:"; echo "$MISSING"; exit 1; \
     fi; \
+    LOADLOG="$(/opt/llama/bin/llama-perplexity --list-devices 2>&1 || true)"; \
+    echo "$LOADLOG" | grep 'load_backend' || true; \
+    echo "$LOADLOG" | grep -q 'loaded CPU backend from /opt/llama/lib/libggml-cpu-' \
+        || { echo "FAIL: the backend loader did not load a CPU variant from /opt/llama/lib"; echo "$LOADLOG"; exit 1; }; \
+    test -s /opt/llama/CPU_VARIANTS.txt; \
     test -x /opt/llama/bin/llama-perplexity; \
     test -x /opt/llama/bin/llama-quantize; \
     test -s /opt/llama/REVISION; \

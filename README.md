@@ -70,15 +70,51 @@ must be actively removed on every build.
 | Path | Contents |
 |---|---|
 | `/opt/llama/bin` | `llama-perplexity`, `llama-quantize`, `llama-imatrix`, `llama-bench`, `llama-server` |
-| `/opt/llama/lib` | ggml/llama shared objects (registered via `ld.so.conf.d`) |
+| `/opt/llama/lib` | ggml/llama shared objects (registered via `ld.so.conf.d`) and, from `-r2` tags, the backend modules `libggml-cuda.so` + `libggml-cpu-<level>.so` |
 | `/opt/llama/venv` | CPU-only torch, transformers, gguf, hf CLI |
 | `/opt/llama/convert_hf_to_gguf.py` | HF safetensors → GGUF, with `gguf-py` installed |
 | `/opt/llama/REVISION` | exact llama.cpp commit |
 | `/opt/llama/NUMERICS.txt` | the fast-math strip diff |
-| `/opt/llama/DEPS.txt` | `ldd` of the real binary — derived, not guessed |
+| `/opt/llama/DEPS.txt` | `ldd` of the binary and of every backend module — derived, not guessed |
+| `/opt/llama/CPU_VARIANTS.txt` | the CPU backend variants built into the image (`-r2` tags on) |
 
 **CPU-only torch is deliberate.** `convert_hf_to_gguf.py` is I/O-bound repacking and
 never touches the GPU; the CPU wheel is ~1GB against ~3GB for the CUDA build.
+
+## CPU backend: portable variants, not `-march=native`
+
+Tags up to `26394b4e6` compiled ggml's CPU backend with `-march=native` — for
+whichever CPU the GitHub runner happened to have (`GGML_NATIVE` defaults ON; the
+build log says `Adding CPU backend variant ggml-cpu: -march=native`). Two problems: an
+image built on an AVX-512 runner dies with an illegal-instruction error on a host
+without AVX-512, and two tags' CPU code can differ only because they landed on
+different runners. The CPU backend runs even when every layer is on the GPU — the
+token-embedding lookup stays on the host.
+
+From `26394b4e6-r2` on, the build uses upstream's own flags
+(`.devops/cuda.Dockerfile`): `GGML_NATIVE=OFF`, `GGML_BACKEND_DL=ON`,
+`GGML_CPU_ALL_VARIANTS=ON`. That compiles one CPU backend per x86 feature level —
+`x64` baseline, `sse42`, `sandybridge`, `ivybridge`, `piledriver`, `haswell`,
+`skylakex`, `cannonlake`, `cascadelake`, `icelake`, `cooperlake`, `zen4`,
+`alderlake`, `sapphirerapids` — each a separate `libggml-cpu-<level>.so`. At
+startup ggml asks each one to score itself against the host's CPUID and loads the
+best, logging it:
+
+```
+load_backend: loaded CPU backend from /opt/llama/lib/libggml-cpu-zen4.so
+```
+
+`GGML_BACKEND_DIR=/opt/llama/lib` is compiled in so the loader finds the modules
+there (by default it only looks next to the executable and in the current
+directory).
+
+**One new failure mode, and its guard.** With dynamic backends, a Release build
+skips a module that fails to load *without a message* — a pod whose driver cannot
+serve `libggml-cuda.so` would quietly measure on the CPU instead of refusing to
+start, which a statically linked binary did. `kld-bootstrap.sh` therefore runs
+`llama-perplexity --list-devices`, fails `STATUS.md` unless the CUDA backend loaded,
+and records both `load_backend` lines. The build itself proves the CPU variants are
+found (the CI runner has no GPU, so the CUDA module can only be checked on a pod).
 
 ## Linking against a driver that isn't there
 
@@ -171,6 +207,7 @@ numbers stop being comparable even when every model still loads.
 
 | Tag | llama.cpp | CUDA base | Use it for |
 |---|---|---|---|
+| `26394b4e6-r2` | b11067+7, 2026-09-21 | 13.4.1 | Same pin and GPU code as `26394b4e6`, rebuilt with the portable CPU backend (see above). Prefer it for new Qwen3.8-Flash-Next work. |
 | `26394b4e6` | b11067+7, 2026-09-21 | 13.4.1 | **Qwen3.8-Flash-Next** (`qwen4exp`): needs `41abbfd59` rms_norm+mul fusion, `37b53fd45` hc ops, `3cf03257f` sparse FA and the `b23701f77` argsort fix, all post-`3057bb66c`. Also carries `ce8caa6e6` (Gemma 4 FA tile retune) — same precision, different summation order, so Gemma 4 numbers from this tag are not comparable with the 13.0 tags. |
 | `3057bb66c` | b10931, 2026-09-12 | 13.0.3 | The existing measurement set (Qwen3.5/3.6/3.8, Gemma 4, Nemotron 3 Nano, Muse Glimmer); B200 campaign. Both CUDA correctness fixes (`b74f590ea`, `73a43d1f6`). |
 | `91f6a6cf3` | b10883, 2026-09-09 | 13.0.3 | Superseded by `3057bb66c`: identical CUDA path (the two commits between them are HIP-only), sm_80/sm_90 only. |
@@ -200,6 +237,19 @@ git tag llama-a30273376 && git push origin llama-a30273376
 Or run the workflow manually with a `ref` input. `:latest` is opt-in only — pinned
 tags are the product, and a moving `:latest` would defeat the reproducibility the pin
 exists for.
+
+**Rebuilding an existing pin takes a revision suffix, never an overwrite.** When the
+image changes but the llama.cpp pin does not (a build-flag fix, a bootstrap fix), run
+the workflow with `image_rev`:
+
+```bash
+gh workflow run build.yml -f ref=26394b4e6 -f image_rev=r2
+```
+
+That publishes `:26394b4e6-r2` and leaves `:26394b4e6` byte-identical, so every number
+already measured on it still points at the same image. The workflow enforces this: it
+refuses to build a tag that is already published, before the hour of compiling.
+Same convention as `llamacpp-hip`.
 
 ## Running on RunPod
 

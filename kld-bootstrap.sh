@@ -22,7 +22,10 @@ VOL_BIN=$LLAMA_DIR/build/bin
 CORPUS_DIR=$WS/corpora
 LLAMA_REF="${LLAMACPP_REF:-}"          # unset => use baked binaries
 
-fail(){ echo "FAILED: $1"; echo "FAILED: $1 ($(date -u))" > "$WS/STATUS.md"; }
+# FAILED gates the READY breadcrumb in step 4. Without it a later READY silently
+# overwrote an earlier failure (a failed corpus download still ended READY).
+FAILED=""
+fail(){ echo "FAILED: $1"; FAILED="$1"; echo "FAILED: $1 ($(date -u))" > "$WS/STATUS.md"; }
 
 # --- 1. SSH ------------------------------------------------------------------
 # This is a generic (non-runpod/*) image, so nothing wires up sshd for us:
@@ -80,6 +83,23 @@ else
     fi
 fi
 
+# --- 2b. Backends actually load ----------------------------------------------
+# Baked images from llama-26394b4e6-r2 on load ggml-cuda and ggml-cpu as dlopen'd
+# modules, and a Release build skips a module that fails to load WITHOUT a
+# message: a pod whose driver cannot serve libggml-cuda.so would quietly measure
+# on the CPU instead of failing. So the CUDA module's load is proven here, and
+# the CPU variant this host selected is recorded. A volume build links its
+# backends normally and prints no load_backend lines, so only baked is gated.
+BACKENDS=""
+if [ -n "$BIN" ]; then
+    BACKENDS="$("$BIN/llama-perplexity" --list-devices 2>&1 \
+                | grep -E 'load_backend: loaded|^ +[A-Za-z]+[0-9]+: ' || true)"
+    echo "${BACKENDS:-no load_backend lines (backends linked in)}"
+    if [ "$SOURCE" = "baked image" ] && ! printf '%s\n' "$BACKENDS" | grep -q 'loaded CUDA backend'; then
+        fail "CUDA backend module did not load - run: $BIN/llama-perplexity --list-devices"
+    fi
+fi
+
 # --- 3. Test corpus ----------------------------------------------------------
 # wikitext-2 test split: the constant across every measurement in this campaign,
 # so cross-model numbers stay comparable.
@@ -108,11 +128,13 @@ fi
 mkdir -p "$WS/models" "$WS/kld" "$WS/hf-cache"
 
 # --- 4. Status breadcrumb for agents ----------------------------------------
-if [ -n "$BIN" ]; then
+if [ -n "$BIN" ] && [ -z "$FAILED" ]; then
 cat > "$WS/STATUS.md" <<EOF
 # Pod bootstrap: READY ($(date -u +%Y-%m-%dT%H:%M:%SZ))
 - llama.cpp: ${ACTIVE_REV:0:9} (source: $SOURCE), binaries in $BIN
 - numerics: fast-math STRIPPED at build (see /opt/llama/NUMERICS.txt)
+- backends (CPU variant = this host's pick of /opt/llama/CPU_VARIANTS.txt):
+$(printf '%s\n' "${BACKENDS:-  (linked in, no load_backend lines)}" | sed 's/^/    /')
 - python: $VENV ($($VENV/bin/python --version 2>&1); torch $($VENV/bin/python -c 'import torch;print(torch.__version__)' 2>/dev/null || echo '?'), CPU-only by design)
 - convert: $VENV/bin/python /opt/llama/convert_hf_to_gguf.py --outtype bf16 <src> --outfile <dst>
 - corpus: $CORPUS_DIR/wiki.test.raw ($(wc -c < "$CORPUS_DIR/wiki.test.raw" 2>/dev/null || echo 0) bytes)

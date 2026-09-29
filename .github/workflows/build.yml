@@ -15,6 +15,11 @@ on:
         required: false
         default: false
         type: boolean
+      image_rev:
+        description: 'Tag suffix for a rebuild that changes the image but not the pin (e.g. r2)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -41,10 +46,22 @@ jobs:
             REF="${GITHUB_REF_NAME#llama-}"       # llama-a30273376 -> a30273376
           fi
           [ -n "$REF" ] || { echo "could not resolve LLAMA_REF"; exit 1; }
+          # Same pin, changed image (e.g. a build-flag fix): a new tag rather than an
+          # overwrite, so every number measured on the old tag keeps pointing at the
+          # same bytes and a host that cached the old image cannot keep serving it.
+          # Same convention as the llamacpp-hip repo.
+          IMAGE_REV="${{ inputs.image_rev }}"
+          case "$IMAGE_REV" in
+            '')           REV_SUFFIX="" ;;
+            *[!a-z0-9.]*) echo "image_rev must match [a-z0-9.]+, got '$IMAGE_REV'"; exit 1 ;;
+            *)            REV_SUFFIX="-${IMAGE_REV}" ;;
+          esac
+          TAG="${REF}${REV_SUFFIX}"
           OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
           echo "ref=$REF"                           >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"                           >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/$OWNER/llamacpp-cuda" >> "$GITHUB_OUTPUT"
-          echo "Pinning llama.cpp @ $REF -> ghcr.io/$OWNER/llamacpp-cuda:$REF"
+          echo "Pinning llama.cpp @ $REF -> ghcr.io/$OWNER/llamacpp-cuda:$TAG"
 
       # nvidia/cuda devel is ~6GB and the CUDA build tree (five SM targets, so five
       # sets of fatbin objects) adds several more; a stock runner does not have room.
@@ -69,6 +86,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}    # built-in; no PAT anywhere
 
+      # Published tags are measurement instruments and must never change under a
+      # number already quoted. Checked before an hour of compiling, not after.
+      - name: Refuse to overwrite a published tag
+        run: |
+          set -euo pipefail
+          TARGET="${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
+          if docker buildx imagetools inspect "$TARGET" >/dev/null 2>&1; then
+            echo "::error::$TARGET is already published; rebuild with image_rev (e.g. r2) instead of overwriting it"
+            exit 1
+          fi
+          echo "$TARGET is unused, building"
+
       - name: Build and push
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
         with:
@@ -83,7 +112,7 @@ jobs:
           # :latest is opt-in only. Pinned tags are the product; a moving :latest
           # would defeat the reproducibility the pin exists for.
           tags: |
-            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.ref }}
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}
             ${{ (github.event_name == 'workflow_dispatch' && inputs.push_latest) && format('{0}:latest', steps.vars.outputs.image) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -94,10 +123,11 @@ jobs:
             echo "### Image published"
             echo ""
             echo '```'
-            echo "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.ref }}"
+            echo "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
             echo '```'
             echo ""
             echo "llama.cpp pin: \`${{ steps.vars.outputs.ref }}\`"
+            echo "CPU backend: portable, one module per x86 level selected at runtime (GGML_NATIVE=OFF, GGML_CPU_ALL_VARIANTS=ON)"
             echo "CUDA base: \`$(sed -n 's/^ARG CUDA_VERSION=//p' Dockerfile)\` (devel + runtime, same patch level)"
             echo "Arch targets: sm_80 (A100), sm_90 (H100), sm_100 (B200), sm_103 (B300), sm_120a (RTX PRO 6000) -- only sm_120 is Blackwell-optimized in llama.cpp, see README"
             echo "Numerics: \`-use_fast_math\` stripped and verified at build time"
