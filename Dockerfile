@@ -7,7 +7,7 @@
 # produces are trustworthy, which is why the fast-math gate below is a hard build
 # failure rather than a warning.
 #
-# Base: nvidia/cuda:13.4.1-{devel,runtime}-ubuntu24.04
+# Base: nvidia/cuda:13.4.2-{devel,runtime}-ubuntu24.04
 #   Build and runtime share the SAME CUDA patch version on purpose: identical
 #   cuBLAS under the measurement. Unlike the ROCm sibling repo (llamacpp-hip),
 #   CUDA publishes a slim runtime tag at the same version, so taking the slim
@@ -27,12 +27,22 @@
 # called with aliased CUB key buffers until upstream b23701f77. Dense models
 # and MoE routing (n_expert <= 512 -> bitonic path) never reach it, which is
 # why the 13.0 tags remain valid for everything measured on them. Upstream's
-# own release builds moved to 13.4.1 in #29202. The 13.4.1 base image's
+# own release builds moved to 13.4.1 in #29202. The 13.4.x base images'
 # NVIDIA_REQUIRE_CUDA accepts driver branches 580/590/595/610 (= CUDA 13.0 to
 # 13.3 hosts) through minor-version compatibility, so it starts on the same
 # RunPod hosts the 13.0 image did; the >= 13.0 host check is unchanged.
+#
+# 13.4.2, not 13.4.1: 13.4.1 bundles CCCL 3.4.2, and DeviceTopK below 3.4.3 has
+# a race (NVIDIA/cccl#10627: thread 0 can mark a CTA's merged histogram done
+# while other threads are still adding their counts), so top-k selections can
+# be silently wrong and nondeterministic. The llama-26394b4e6(-r2) tags were
+# built on 13.4.1 at a pin that gated DeviceTopK at CCCL >= 3.2, so they ship
+# the racy kernel (their CUB namespace reads _V_300402_). Upstream now gates it
+# at >= 3.4.3 (767767850, #29792) and falls back to the sort below that; 13.4.2
+# bundles 3.4.3, so this base gets the fast kernel without the race. The build
+# stage records the CCCL version and refuses DeviceTopK with anything older.
 
-ARG CUDA_VERSION=13.4.1
+ARG CUDA_VERSION=13.4.2
 ARG BUILD_BASE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
 ARG RUNTIME_BASE=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
 
@@ -83,8 +93,10 @@ ARG CUDA_ARCHS="80;90;100;103;120a-real"
 #   q5_1-q5_1  Qwen3.8 Vulkan config
 ARG CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;q5_1-q4_1;bf16-q8_0;q5_1-q5_1"
 
+# libssl-dev, not libcurl: LLAMA_CURL is deprecated and ignored upstream; HTTPS
+# for the tools' downloader comes from cpp-httplib + OpenSSL (LLAMA_OPENSSL).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake git ccache libcurl4-openssl-dev libssl-dev ca-certificates \
+        build-essential cmake git ccache libssl-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -156,7 +168,7 @@ RUN cmake -S . -B build \
         -DGGML_BACKEND_DL=ON \
         -DGGML_CPU_ALL_VARIANTS=ON \
         -DGGML_BACKEND_DIR=/opt/llama/lib \
-        -DLLAMA_CURL=ON \
+        -DLLAMA_OPENSSL=ON \
         -DLLAMA_BUILD_TESTS=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA_FA_QUANTS="${CUDA_FA_QUANTS}" \
@@ -212,6 +224,24 @@ RUN set -eu; \
     fi; \
     echo "PASS: only the driver library is unresolved (supplied at runtime)"
 
+# CCCL gate: record the CCCL version the CUDA module was compiled against, and
+# refuse a DeviceTopK kernel built with anything older than 3.4.3 (the race in
+# NVIDIA/cccl#10627, see the base-image note at the top). The version comes from
+# the toolkit's own header; DeviceTopK is detected in the shipped module itself,
+# so a future pin that changes the source-side gate cannot slip the racy kernel
+# past this. An unreadable version with DeviceTopK present fails too: safety
+# that cannot be shown is not assumed.
+RUN set -eu; \
+    CCCL_H="$(find /usr/local/cuda/ -path '*__cccl/version.h' 2>/dev/null | head -1)"; \
+    CCCL="$(sed -n 's/^#[[:space:]]*define[[:space:]]\{1,\}CCCL_VERSION[[:space:]]\{1,\}\([0-9]\{1,\}\).*/\1/p' "${CCCL_H:-/dev/null}" | head -1)"; \
+    echo "CCCL_VERSION=${CCCL:-unknown} (${CCCL_H:-header not found})" | tee /opt/llama/CCCL_VERSION.txt; \
+    if grep -q DeviceTopK /opt/llama/lib/libggml-cuda.so; then \
+        echo "libggml-cuda.so contains CUB DeviceTopK"; \
+        { [ -n "$CCCL" ] && [ "$CCCL" -ge 3004003 ]; } \
+            || { echo "FAIL: DeviceTopK built against CCCL ${CCCL:-unknown} < 3.4.3 (race, NVIDIA/cccl#10627)"; exit 1; }; \
+    fi; \
+    echo "PASS: CCCL gate"
+
 # -------------------------------------------------------------- runtime stage
 FROM ${RUNTIME_BASE} AS runtime
 
@@ -261,6 +291,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # version (requirements-convert_legacy_llama.txt), so a conflict now fails
 # loudly instead of time-travelling.
 #
+# No extras on huggingface_hub: 1.x dropped both `hf_transfer` (downloads go
+# through hf-xet, a default dependency on x86_64) and `cli` (the `hf` command is
+# built in); pip only warned that they no longer exist.
+#
 # This layer sits BEFORE `COPY --from=build` on purpose: it depends only on the
 # runtime base, so BuildKit runs it in parallel with the CUDA compile and a PyPI
 # problem fails the build in minutes instead of an hour in. gguf-py, which does
@@ -269,7 +303,7 @@ RUN python3 -m venv /opt/llama/venv \
  && /opt/llama/venv/bin/pip install -q -U pip \
  && /opt/llama/venv/bin/pip install -q --index-url https://download.pytorch.org/whl/cpu torch \
  && /opt/llama/venv/bin/pip install -q -U \
-        "huggingface_hub[hf_transfer,cli]<2" "transformers>=4.57.6" safetensors \
+        "huggingface_hub<2" "transformers>=4.57.6" safetensors \
         sentencepiece protobuf "numpy~=2.2.6"
 
 COPY --from=build /opt/llama /opt/llama
@@ -289,9 +323,13 @@ COPY kld-bootstrap.sh /usr/local/bin/kld-bootstrap.sh
 COPY verify-backends.py /opt/llama/verify-backends.py
 RUN chmod +x /usr/local/bin/kld-bootstrap.sh /opt/llama/verify-backends.py
 
+# HF_XET_HIGH_PERFORMANCE replaces HF_HUB_ENABLE_HF_TRANSFER, which huggingface_hub
+# 1.x deprecates with a FutureWarning on every import ("'hf_transfer' is not used
+# anymore. Please use HF_XET_HIGH_PERFORMANCE") -- including inside transformers
+# during a conversion.
 ENV PATH=/opt/llama/bin:/opt/llama/venv/bin:${PATH}
 ENV HF_HOME=/workspace/hf-cache
-ENV HF_HUB_ENABLE_HF_TRANSFER=1
+ENV HF_XET_HIGH_PERFORMANCE=1
 
 # ENV above only reaches the container's own entrypoint. An `ssh pod "command"`
 # session is spawned by sshd, not by that process, and a non-interactive bash
@@ -303,9 +341,9 @@ ENV HF_HUB_ENABLE_HF_TRANSFER=1
 # /etc/environment is read by pam_env for SSH logins including non-interactive
 # ones, so it is the one place that fixes all of them. It performs no variable
 # expansion, hence the literal list. profile.d covers interactive shells too.
-RUN printf 'PATH="/opt/llama/bin:/opt/llama/venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\nHF_HOME="/workspace/hf-cache"\nHF_HUB_ENABLE_HF_TRANSFER="1"\n' \
+RUN printf 'PATH="/opt/llama/bin:/opt/llama/venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\nHF_HOME="/workspace/hf-cache"\nHF_XET_HIGH_PERFORMANCE="1"\n' \
         > /etc/environment \
- && printf '#!/bin/sh\nexport PATH=/opt/llama/bin:/opt/llama/venv/bin:$PATH\nexport HF_HOME=/workspace/hf-cache\nexport HF_HUB_ENABLE_HF_TRANSFER=1\n' \
+ && printf '#!/bin/sh\nexport PATH=/opt/llama/bin:/opt/llama/venv/bin:$PATH\nexport HF_HOME=/workspace/hf-cache\nexport HF_XET_HIGH_PERFORMANCE=1\n' \
         > /etc/profile.d/llama.sh \
  && chmod +x /etc/profile.d/llama.sh
 
@@ -341,6 +379,7 @@ RUN set -eu; \
     fi; \
     python3 /opt/llama/verify-backends.py --require CPU; \
     test -s /opt/llama/CPU_VARIANTS.txt; \
+    test -s /opt/llama/CCCL_VERSION.txt; \
     test -s /opt/llama/PYDEPS.txt; \
     grep -iE '^(torch|transformers|huggingface.hub|tokenizers|numpy|gguf)[=@ ]' /opt/llama/PYDEPS.txt || true; \
     test -x /opt/llama/bin/llama-perplexity; \

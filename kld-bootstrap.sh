@@ -66,7 +66,7 @@ else
     echo "building llama.cpp at ref '$LLAMA_REF' on the volume (escape hatch)"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq && apt-get install -y -qq \
-        build-essential cmake ccache libcurl4-openssl-dev cuda-toolkit-13-0 || fail "apt toolchain"
+        build-essential cmake ccache libssl-dev cuda-toolkit-13-0 || fail "apt toolchain"
     [ -d "$LLAMA_DIR/.git" ] || git clone https://github.com/ggml-org/llama.cpp "$LLAMA_DIR" || fail "git clone"
     cd "$LLAMA_DIR" && git fetch --all --tags -q && git checkout -q "$LLAMA_REF" || fail "checkout $LLAMA_REF"
     # Same numerics gate as the image build: strip fast-math, then prove it.
@@ -75,7 +75,7 @@ else
         fail "fast-math survived the strip in volume build"
     else
         cmake -S . -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="80;90" \
-              -DLLAMA_CURL=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release >/dev/null \
+              -DLLAMA_OPENSSL=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release >/dev/null \
           && cmake --build build -j"$(nproc)" --target \
               llama-perplexity llama-quantize llama-imatrix llama-bench llama-server \
           && { BIN="$VOL_BIN"; ACTIVE_REV="$(git rev-parse HEAD)"; SOURCE="volume build"; } \

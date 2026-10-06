@@ -78,6 +78,7 @@ must be actively removed on every build.
 | `/opt/llama/DEPS.txt` | `ldd` of the binary and of every backend module — derived, not guessed |
 | `/opt/llama/CPU_VARIANTS.txt` | the CPU backend variants built into the image (`-r2` tags on) |
 | `/opt/llama/PYDEPS.txt` | `pip freeze` of the conversion venv — the versions this build actually got (`-r2` tags on) |
+| `/opt/llama/CCCL_VERSION.txt` | CCCL the CUDA module was compiled against (`a7fb71fab` on); the build refuses CUB `DeviceTopK` below 3.4.3 |
 
 **CPU-only torch is deliberate.** `convert_hf_to_gguf.py` is I/O-bound repacking and
 never touches the GPU; the CPU wheel is ~1GB against ~3GB for the CUDA build.
@@ -178,9 +179,23 @@ BF16, to price the cache quantization itself.
 
 ## Base image
 
-Both stages use `nvidia/cuda:13.4.1-*-ubuntu24.04` — build on `devel`, runtime on the
+Both stages use `nvidia/cuda:13.4.2-*-ubuntu24.04` — build on `devel`, runtime on the
 slim `runtime` tag. Same CUDA patch version on both, so cuBLAS is identical under the
-measurement. Tags up to `3057bb66c` were built on `13.0.3`; see [Pins](#pins).
+measurement. Tags up to `3057bb66c` were built on `13.0.3`, the `26394b4e6` tags on
+`13.4.1`; see [Pins](#pins).
+
+**Why 13.4.2 and not 13.4.1 — a race in `DeviceTopK`.** CUDA 13.4.1 bundles CCCL
+3.4.2, and CUB's `DeviceTopK` before 3.4.3 has a race (NVIDIA/cccl#10627): thread 0
+can mark a CTA's merged histogram done while other threads are still adding their
+counts, so a top-k selection can be silently wrong and differ run to run. The
+`26394b4e6` and `26394b4e6-r2` images were built on 13.4.1 at a pin that enabled
+`DeviceTopK` from CCCL 3.2, so they ship the racy kernel. Their CUB symbols read
+`cub::_V_300402_SM_800_900_1000_1030_1200`, which is how this was confirmed without
+Docker. Upstream now enables it only from 3.4.3 (`767767850`, #29792) and uses the sort
+fallback below that. 13.4.2 bundles 3.4.3, and the build records the version in
+`/opt/llama/CCCL_VERSION.txt` and **fails** if `DeviceTopK` was compiled against
+anything older. Only `TOP_K` users are affected: sparse-attention indexers
+(Qwen3.8-Flash-Next, DeepSeek V4, GLM-DSA). MoE routing uses `ARGSORT`.
 
 **Why 13.4 and not 13.0.** ggml-cuda's `TOP_K` uses `cub::DeviceTopK` only when the
 toolkit's bundled CCCL is ≥ 3.2 (`top-k.cu`); CUDA 13.0 ships CCCL 3.0, 13.2 → 3.2,
@@ -192,7 +207,7 @@ that was also called with aliased CUB key buffers until upstream `b23701f77`
 never reach it, which is why the 13.0 tags stay valid for everything measured on
 them. Upstream's own release builds moved to 13.4.1 in #29202.
 
-**Host compatibility is unchanged.** The 13.4.1 base's `NVIDIA_REQUIRE_CUDA` accepts
+**Host compatibility is unchanged.** The 13.4.x bases' `NVIDIA_REQUIRE_CUDA` accepts
 driver branches 580 / 590 / 595 / 610 — CUDA 13.0 through 13.3 hosts — through
 minor-version compatibility, so the image starts wherever the 13.0 one did. The
 ≥ 13.0 host check below still applies.
@@ -221,8 +236,9 @@ numbers stop being comparable even when every model still loads.
 
 | Tag | llama.cpp | CUDA base | Use it for |
 |---|---|---|---|
-| `26394b4e6-r2` | b11067+7, 2026-09-21 | 13.4.1 | Same pin and GPU code as `26394b4e6`, rebuilt with the portable CPU backend (see above). Prefer it for new Qwen3.8-Flash-Next work. |
-| `26394b4e6` | b11067+7, 2026-09-21 | 13.4.1 | **Qwen3.8-Flash-Next** (`qwen4exp`): needs `41abbfd59` rms_norm+mul fusion, `37b53fd45` hc ops, `3cf03257f` sparse FA and the `b23701f77` argsort fix, all post-`3057bb66c`. Also carries `ce8caa6e6` (Gemma 4 FA tile retune) — same precision, different summation order, so Gemma 4 numbers from this tag are not comparable with the 13.0 tags. |
+| `a7fb71fab` | b11401, 2026-10-05 | 13.4.2 | **Qwen3.8-Flash-Next and any other `TOP_K` model (DeepSeek V4, GLM-DSA)**: CCCL 3.4.3, so race-free `DeviceTopK`; current `qwen4exp` code; `llama-imatrix --nextn` / `-md` (importance data for MTP layers); portable CPU backend. Same pin as the HIP image. A new comparison set for everything. |
+| `26394b4e6-r2` | b11067+7, 2026-09-21 | 13.4.1 | **Do not use for `TOP_K` models** — racy `DeviceTopK` (CCCL 3.4.2, see [Base image](#base-image)). Otherwise `26394b4e6` with the portable CPU backend. |
+| `26394b4e6` | b11067+7, 2026-09-21 | 13.4.1 | **Do not use for `TOP_K` models** — racy `DeviceTopK` (CCCL 3.4.2), the very thing this tag was cut for. Was the Qwen3.8-Flash-Next (`qwen4exp`) tag: needs `41abbfd59` rms_norm+mul fusion, `37b53fd45` hc ops, `3cf03257f` sparse FA and the `b23701f77` argsort fix, all post-`3057bb66c`. Also carries `ce8caa6e6` (Gemma 4 FA tile retune) — same precision, different summation order, so Gemma 4 numbers from this tag are not comparable with the 13.0 tags. |
 | `3057bb66c` | b10931, 2026-09-12 | 13.0.3 | The existing measurement set (Qwen3.5/3.6/3.8, Gemma 4, Nemotron 3 Nano, Muse Glimmer); B200 campaign. Both CUDA correctness fixes (`b74f590ea`, `73a43d1f6`). |
 | `91f6a6cf3` | b10883, 2026-09-09 | 13.0.3 | Superseded by `3057bb66c`: identical CUDA path (the two commits between them are HIP-only), sm_80/sm_90 only. |
 | `0cae43063` | b10839, 2026-09-07 | 13.0.3 | Superseded — sm_80/sm_90 only, upstream-default FA pairs only. |
