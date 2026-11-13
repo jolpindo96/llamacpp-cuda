@@ -81,17 +81,25 @@ ARG CUDA_ARCHS="80;90;100;103;120a-real"
 # falls back at runtime with a warning rather than being unavailable, which is
 # easy to miss in a log and silently changes what you are measuring.
 #
-# The upstream default is "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16". Passing this
-# REPLACES that default, so every entry we still need must be repeated here --
-# in particular f16-f16, which is the default KV cache type and therefore what
-# every standard perplexity/KLD run uses. Dropping it would break the baseline.
+# The upstream default is "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16", plus
+# "f8_e4m3-f8_e4m3" since b12359 (#28413). Passing this REPLACES that default, so
+# every entry we still need must be repeated here -- in particular f16-f16, which
+# is the default KV cache type and therefore what every standard perplexity/KLD
+# run uses. Dropping it would break the baseline.
 #
 # Beyond the defaults we add the combinations James actually serves with, so the
 # rig can measure a model at its real serving config rather than only at f16:
-#   q5_1-q4_1  Qwen3.8-27B CUDA server config (-ctk q5_1 -ctv q4_1)
-#   bf16-q8_0  Gemma-4-31B no-image config
-#   q5_1-q5_1  Qwen3.8 Vulkan config
-ARG CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;q5_1-q4_1;bf16-q8_0;q5_1-q5_1"
+#   q5_1-q4_1        Qwen3.8-27B CUDA server config (-ctk q5_1 -ctv q4_1)
+#   bf16-q8_0        Gemma-4-31B no-image config
+#   q5_1-q5_1        Qwen3.8 Vulkan config
+# and the FP8 KV cache (-ctk/-ctv f8_e4m3, #28392), to compare with vLLM's fp8 KV
+# at the same cache precision:
+#   f8_e4m3-f8_e4m3  pins before b12359 reject this type at configure time
+#                    (FATAL_ERROR "unknown type"), so the build step below drops
+#                    the f8_e4m3 pairs for them and says so in the log. Those pins
+#                    have no FP8 KV cache at all, so nothing they measure changes.
+# The list actually compiled is written to /opt/llama/FA_QUANTS.txt.
+ARG CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;q5_1-q4_1;bf16-q8_0;q5_1-q5_1;f8_e4m3-f8_e4m3"
 
 # libssl-dev, not libcurl: LLAMA_CURL is deprecated and ignored upstream; HTTPS
 # for the tools' downloader comes from cpp-httplib + OpenSSL (LLAMA_OPENSSL).
@@ -161,7 +169,21 @@ RUN set -eu; \
 #                          only looks next to the executable and in the cwd
 # ggml's CMake makes the ggml target depend on every backend module, so the
 # --target list below still builds all of them.
-RUN cmake -S . -B build \
+#
+# FA pairs: a pin whose FA_TYPES list (ggml/cmake/common.cmake) has no f8_e4m3
+# predates FP8 flash attention and would stop at configure time on that pair, so
+# it is dropped there, with a NOTE in the log. Every other pair goes through
+# untouched, and FA_QUANTS.txt records what was compiled.
+RUN set -eu; \
+    FA_QUANTS="${CUDA_FA_QUANTS}"; \
+    if ! grep -Eqs 'set\(FA_TYPES[^)]*f8_e4m3' ggml/cmake/common.cmake; then \
+        FA_QUANTS="$(printf '%s\n' "${CUDA_FA_QUANTS}" | tr ';,' '\n\n' | grep -v 'f8_e4m3' | paste -sd ';' -)"; \
+        echo "NOTE: this pin predates FP8 flash attention; dropped the f8_e4m3 pairs"; \
+    fi; \
+    mkdir -p /opt/llama; \
+    printf '%s\n' "${FA_QUANTS}" | tr ';,' '\n\n' > /opt/llama/FA_QUANTS.txt; \
+    echo "GGML_CUDA_FA_QUANTS=${FA_QUANTS}"; \
+    cmake -S . -B build \
         -DGGML_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
         -DGGML_NATIVE=OFF \
@@ -171,7 +193,7 @@ RUN cmake -S . -B build \
         -DLLAMA_OPENSSL=ON \
         -DLLAMA_BUILD_TESTS=OFF \
         -DCMAKE_BUILD_TYPE=Release \
-        -DGGML_CUDA_FA_QUANTS="${CUDA_FA_QUANTS}" \
+        -DGGML_CUDA_FA_QUANTS="${FA_QUANTS}" \
         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
  && cmake --build build --config Release -j"$(nproc)" \
         --target llama-perplexity llama-quantize llama-imatrix llama-bench llama-server

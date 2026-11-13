@@ -79,6 +79,7 @@ must be actively removed on every build.
 | `/opt/llama/CPU_VARIANTS.txt` | the CPU backend variants built into the image (`-r2` tags on) |
 | `/opt/llama/PYDEPS.txt` | `pip freeze` of the conversion venv — the versions this build actually got (`-r2` tags on) |
 | `/opt/llama/CCCL_VERSION.txt` | CCCL the CUDA module was compiled against (`a7fb71fab` on); the build refuses CUB `DeviceTopK` below 3.4.3 |
+| `/opt/llama/FA_QUANTS.txt` | the flash-attention KV pairs actually compiled, one per line (`b1b770d90` on) |
 
 **CPU-only torch is deliberate.** `convert_hf_to_gguf.py` is I/O-bound repacking and
 never touches the GPU; the CPU wheel is ~1GB against ~3GB for the CUDA build.
@@ -160,8 +161,8 @@ at runtime **with only a warning** — easy to miss in a log, and it silently ch
 what you are measuring.
 
 Passing the flag *replaces* the upstream default
-(`q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16`), so this image repeats those and adds the
-combinations actually served with:
+(`q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16`, plus `f8_e4m3-f8_e4m3` since b12359), so
+this image repeats those and adds the combinations actually served with:
 
 | Pair | Why |
 |---|---|
@@ -172,6 +173,7 @@ combinations actually served with:
 | `bf16-q8_0` | Gemma-4-31B no-image config |
 | `q5_1-q5_1` | Qwen3.8 Vulkan config |
 | `q4_0-q4_0` | upstream default, kept |
+| `f8_e4m3-f8_e4m3` | FP8 KV cache (`-ctk/-ctv f8_e4m3`, b12359+), to compare with vLLM's fp8 KV at the same cache precision. Pins before b12359 reject the type at configure time, so the build drops this pair for them and logs a NOTE; `/opt/llama/FA_QUANTS.txt` shows what was compiled |
 
 This is what makes it possible to measure a model **at its real serving config**, not
 only at f16 — e.g. running perplexity twice, once with quantized KV cache and once at
